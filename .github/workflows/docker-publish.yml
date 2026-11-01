@@ -1,0 +1,87 @@
+name: Practical 12 - Prometheus Metrics and GHCR Publish
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: practical-12-image-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: student-result-prediction-ci-cd-12
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare GHCR image name
+        run: |
+          IMAGE_ID="ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}"
+          echo "IMAGE_ID=$(echo "$IMAGE_ID" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build monitored image from Practical 11 model image
+        run: docker build -t "$IMAGE_ID:ci" .
+
+      - name: Start test container
+        run: docker run -d --name student-result-p12 -p 5000:5000 "$IMAGE_ID:ci"
+
+      - name: Test health endpoint and model readiness
+        run: |
+          for attempt in {1..25}; do
+            if curl --fail --silent http://localhost:5000/health; then break; fi
+            sleep 3
+          done
+          curl --fail --silent http://localhost:5000/health | grep -q '"model_loaded":true'
+
+      - name: Test Prometheus metrics endpoint
+        run: |
+          curl --fail --silent http://localhost:5000/metrics | tee /tmp/metrics.txt
+          grep -q 'student_api_model_loaded 1.0' /tmp/metrics.txt
+
+      - name: Test valid PASS prediction and prediction counter
+        run: |
+          response=$(curl --fail --silent --show-error -X POST http://localhost:5000/predict -H "Content-Type: application/json" --data '{"attendance":90,"internal_marks":85,"assignment_marks":88,"previous_score":80}')
+          echo "$response"
+          echo "$response" | grep -q '"prediction":"PASS"'
+          curl --fail --silent http://localhost:5000/metrics | grep -q 'student_api_predictions_total{result="success"} 1.0'
+
+      - name: Test invalid request is counted
+        run: |
+          code=$(curl -s -o /tmp/invalid.json -w "%{http_code}" -X POST http://localhost:5000/predict -H "Content-Type: application/json" --data '{"attendance":"bad"}')
+          test "$code" = "400"
+          curl --fail --silent http://localhost:5000/metrics | grep -q 'student_api_http_requests_total{method="POST",path="/predict",status="400"} 1.0'
+
+      - name: Test missing route is counted
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/not-a-real-route)
+          test "$code" = "404"
+          curl --fail --silent http://localhost:5000/metrics | grep -q 'student_api_http_requests_total{method="GET",path="/not-a-real-route",status="404"} 1.0'
+
+      - name: Show application logs
+        if: always()
+        run: docker logs student-result-p12 || true
+
+      - name: Remove test container
+        if: always()
+        run: docker rm -f student-result-p12 || true
+
+      - name: Publish tested image to GHCR
+        run: |
+          docker tag "$IMAGE_ID:ci" "$IMAGE_ID:latest"
+          docker tag "$IMAGE_ID:ci" "$IMAGE_ID:sha-${GITHUB_SHA}"
+          docker push "$IMAGE_ID:latest"
+          docker push "$IMAGE_ID:sha-${GITHUB_SHA}"
